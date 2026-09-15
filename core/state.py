@@ -1,144 +1,118 @@
-"""Agent state machine with explicit transitions and checkpointing."""
+"""Validated agent state transitions and durable JSON checkpoints."""
+
+from __future__ import annotations
 
 import json
+import re
 import time
+from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from typing import Any
 
 
-class AgentState(Enum):
-    """Possible states for the agent loop."""
+class AgentState(str, Enum):
     IDLE = "idle"
     OBSERVING = "observing"
     PLANNING = "planning"
+    WAITING_APPROVAL = "waiting_approval"
     ACTING = "acting"
     VERIFYING = "verifying"
-    WAITING_APPROVAL = "waiting_approval"
-    ERROR = "error"
     COMPLETED = "completed"
+    FAILED = "failed"
 
 
-# Valid state transitions
-TRANSITIONS = {
-    AgentState.IDLE: [AgentState.OBSERVING],
-    AgentState.OBSERVING: [AgentState.PLANNING, AgentState.ERROR],
-    AgentState.PLANNING: [AgentState.ACTING, AgentState.WAITING_APPROVAL],
-    AgentState.ACTING: [AgentState.VERIFYING, AgentState.ERROR],
-    AgentState.VERIFYING: [AgentState.OBSERVING, AgentState.COMPLETED, AgentState.ERROR],
-    AgentState.WAITING_APPROVAL: [AgentState.ACTING, AgentState.ERROR],
-    AgentState.ERROR: [AgentState.OBSERVING, AgentState.IDLE],
-    AgentState.COMPLETED: [AgentState.IDLE],
+TRANSITIONS: dict[AgentState, frozenset[AgentState]] = {
+    AgentState.IDLE: frozenset({AgentState.OBSERVING}),
+    AgentState.OBSERVING: frozenset({AgentState.PLANNING}),
+    AgentState.PLANNING: frozenset(
+        {AgentState.ACTING, AgentState.VERIFYING, AgentState.WAITING_APPROVAL, AgentState.FAILED}
+    ),
+    AgentState.WAITING_APPROVAL: frozenset({AgentState.ACTING, AgentState.FAILED}),
+    AgentState.ACTING: frozenset({AgentState.VERIFYING, AgentState.FAILED}),
+    AgentState.VERIFYING: frozenset(
+        {AgentState.OBSERVING, AgentState.COMPLETED, AgentState.FAILED}
+    ),
+    AgentState.COMPLETED: frozenset({AgentState.IDLE}),
+    AgentState.FAILED: frozenset({AgentState.IDLE, AgentState.OBSERVING}),
 }
 
 
-@dataclass
-class StepRecord:
-    """Record of a single agent step."""
-    step_id: int
+@dataclass(frozen=True)
+class TraceEvent:
+    sequence: int
+    event: str
     state: str
-    action: str
-    tool: Optional[str] = None
-    input_data: Optional[Dict] = None
-    output_data: Optional[Dict] = None
-    tokens_used: int = 0
-    cost_usd: float = 0.0
+    details: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
-    error: Optional[str] = None
 
 
 class StateManager:
-    """
-    Manages agent state with explicit transitions and checkpointing.
+    """Own state, context, audit events, and atomic checkpoints."""
 
-    Every transition is validated and logged. State can be saved to disk
-    and restored, enabling crash recovery and failure replay.
-    """
+    SCHEMA_VERSION = 1
 
-    def __init__(self, checkpoint_dir: str = "checkpoints"):
-        self.state = AgentState.IDLE
-        self.steps: List[StepRecord] = []
-        self.context: Dict[str, Any] = {}
-        self.step_counter = 0
+    def __init__(self, checkpoint_dir: str | Path = "checkpoints") -> None:
         self.checkpoint_dir = Path(checkpoint_dir)
-        self.checkpoint_dir.mkdir(exist_ok=True)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.state = AgentState.IDLE
+        self.context: dict[str, Any] = {}
+        self.trace: list[TraceEvent] = []
 
-    def transition(self, new_state: AgentState) -> None:
-        """Validate and execute state transition."""
-        valid = TRANSITIONS.get(self.state, [])
-        if new_state not in valid:
+    def transition(self, new_state: AgentState, **details: Any) -> None:
+        if new_state not in TRANSITIONS[self.state]:
+            allowed = ", ".join(sorted(state.value for state in TRANSITIONS[self.state]))
             raise ValueError(
-                f"Invalid transition: {self.state.value} → {new_state.value}. "
-                f"Valid transitions: {[s.value for s in valid]}"
+                f"invalid transition {self.state.value!r} -> {new_state.value!r}; "
+                f"allowed: {allowed or 'none'}"
             )
-        old_state = self.state
+        previous = self.state
         self.state = new_state
-        self._log(f"State: {old_state.value} → {new_state.value}")
+        self.record("transition", previous=previous.value, current=new_state.value, **details)
 
-    def record_step(
-        self,
-        action: str,
-        tool: Optional[str] = None,
-        input_data: Optional[Dict] = None,
-        output_data: Optional[Dict] = None,
-        tokens_used: int = 0,
-        cost_usd: float = 0.0,
-        error: Optional[str] = None,
-    ) -> StepRecord:
-        """Record an agent step."""
-        self.step_counter += 1
-        step = StepRecord(
-            step_id=self.step_counter,
+    def record(self, event: str, **details: Any) -> TraceEvent:
+        if not event.strip():
+            raise ValueError("event must not be empty")
+        item = TraceEvent(
+            sequence=len(self.trace) + 1,
+            event=event,
             state=self.state.value,
-            action=action,
-            tool=tool,
-            input_data=input_data,
-            output_data=output_data,
-            tokens_used=tokens_used,
-            cost_usd=cost_usd,
-            error=error,
+            details=details,
         )
-        self.steps.append(step)
-        return step
+        self.trace.append(item)
+        return item
 
-    def checkpoint(self, name: Optional[str] = None) -> str:
-        """Save current state to disk."""
-        name = name or f"step_{self.step_counter}"
-        path = self.checkpoint_dir / f"{name}.json"
-        data = {
+    def checkpoint(self, name: str = "latest") -> Path:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-.")
+        if not safe_name:
+            raise ValueError("checkpoint name must contain a safe character")
+        path = self.checkpoint_dir / f"{safe_name}.json"
+        payload = {
+            "schema_version": self.SCHEMA_VERSION,
             "state": self.state.value,
-            "step_counter": self.step_counter,
             "context": self.context,
-            "steps": [asdict(s) for s in self.steps],
+            "trace": [asdict(item) for item in self.trace],
         }
-        path.write_text(json.dumps(data, indent=2))
-        self._log(f"Checkpoint saved: {path}")
-        return str(path)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
+        return path
 
     @classmethod
-    def load_checkpoint(cls, path: str) -> "StateManager":
-        """Restore state from checkpoint."""
-        data = json.loads(Path(path).read_text())
-        mgr = cls()
-        mgr.state = AgentState(data["state"])
-        mgr.step_counter = data["step_counter"]
-        mgr.context = data["context"]
-        mgr.steps = [StepRecord(**s) for s in data["steps"]]
-        mgr._log(f"Loaded checkpoint: {path}")
-        return mgr
+    def load_checkpoint(cls, path: str | Path) -> "StateManager":
+        source = Path(path)
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != cls.SCHEMA_VERSION:
+            raise ValueError("unsupported or missing checkpoint schema_version")
+        manager = cls(source.parent)
+        manager.state = AgentState(payload["state"])
+        context = payload.get("context", {})
+        trace = payload.get("trace", [])
+        if not isinstance(context, dict) or not isinstance(trace, list):
+            raise ValueError("checkpoint context or trace has an invalid type")
+        manager.context = context
+        manager.trace = [TraceEvent(**item) for item in trace]
+        return manager
 
-    def get_trace(self) -> List[Dict]:
-        """Get execution trace for debugging."""
-        return [asdict(s) for s in self.steps]
-
-    def get_total_cost(self) -> float:
-        """Get total cost across all steps."""
-        return sum(s.cost_usd for s in self.steps)
-
-    def get_total_tokens(self) -> int:
-        """Get total tokens used."""
-        return sum(s.tokens_used for s in self.steps)
-
-    def _log(self, msg: str) -> None:
-        print(f"[StateManager] {msg}")
+    def get_trace(self) -> list[dict[str, Any]]:
+        return [asdict(item) for item in self.trace]

@@ -1,14 +1,16 @@
-"""Researcher agent — searches for information."""
+"""A local research workflow assembled from explicit, injected tools."""
 
-from typing import Dict
+from __future__ import annotations
+
+from core.agent import PlanStep
+
+from .planner import ScriptedPlanner
 
 
-class ResearcherAgent:
-    """Searches the web and extracts information."""
-
-    def __init__(self, tools=None):
-        self.tools = tools
-
-    def research(self, query: str) -> Dict:
-        """Research a topic."""
-        return {"query": query, "results": [], "summary": f"Research results for: {query}"}
+def build_research_planner(query: str) -> ScriptedPlanner:
+    """Create a one-step planner; callers decide which search provider is registered."""
+    if not query.strip():
+        raise ValueError("query must not be empty")
+    return ScriptedPlanner(
+        [PlanStep(tool="search", arguments={"query": query}, rationale="collect sources")]
+    )

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reliable-agent-workbench"
+version = "0.2.0"
+description = "A deterministic workbench for testing agent reliability boundaries"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Faizan Muktar Shaikh"}]
+
+[project.scripts]
+reliable-agent-workbench = "core.cli:main"
+
+[tool.setuptools]
+packages = ["core", "agents", "tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
