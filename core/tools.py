@@ -1,107 +1,146 @@
-"""Tool registry with permissions, schemas, and rate limiting."""
+"""Tool registry with explicit permissions, approval gates, and rate limits."""
+
+from __future__ import annotations
 
 import time
-from typing import Any, Callable, Dict, List, Optional
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
 from enum import Enum
+from typing import Any
 
 
-class Permission(Enum):
-    """Tool permission levels."""
-    READ = "read"           # Read-only access
-    WRITE = "write"         # File/data modification
-    EXECUTE = "execute"     # Code execution
-    NETWORK = "network"     # External API calls
-    SENSITIVE = "sensitive" # Requires human approval
+class Permission(str, Enum):
+    READ = "read"
+    WRITE = "write"
+    EXECUTE = "execute"
+    NETWORK = "network"
+    SENSITIVE = "sensitive"
 
 
-@dataclass
+@dataclass(frozen=True)
 class ToolSchema:
-    """Schema for a registered tool."""
     name: str
     description: str
-    permissions: List[Permission]
-    parameters: Dict[str, Any]  # JSON Schema style
-    rate_limit: int = 10  # Max calls per minute
+    permissions: tuple[Permission, ...]
+    parameters: Mapping[str, Any]
+    rate_limit: int = 10
     requires_approval: bool = False
 
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("tool name must not be empty")
+        if self.rate_limit < 1:
+            raise ValueError("rate_limit must be at least 1")
 
-@dataclass
+
+@dataclass(frozen=True)
 class ToolCall:
-    """Record of a tool invocation."""
     tool_name: str
-    input_data: Dict
-    output_data: Any
-    success: bool
-    error: Optional[str] = None
+    input_data: dict[str, Any]
+    output_data: Any = None
+    success: bool = False
+    error: str | None = None
     duration_ms: float = 0.0
     timestamp: float = field(default_factory=time.time)
 
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
 
 class ToolRegistry:
-    """
-    Registry for agent tools with permission checking and rate limiting.
+    """Register callables and enforce controls before invocation."""
 
-    Tools must be registered before use. Each tool has:
-    - A schema describing its inputs/outputs
-    - Permission requirements
-    - Rate limits
-    - Optional approval requirements
-    """
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._schemas: dict[str, ToolSchema] = {}
+        self._functions: dict[str, Callable[..., Any]] = {}
+        self._calls: dict[str, list[float]] = {}
+        self.history: list[ToolCall] = []
 
-    def __init__(self):
-        self._tools: Dict[str, ToolSchema] = {}
-        self._functions: Dict[str, Callable] = {}
-        self._call_history: List[ToolCall] = []
-        self._call_counts: Dict[str, List[float]] = {}
+    def register(self, schema: ToolSchema, function: Callable[..., Any]) -> None:
+        if schema.name in self._schemas:
+            raise ValueError(f"tool {schema.name!r} is already registered")
+        self._schemas[schema.name] = schema
+        self._functions[schema.name] = function
+        self._calls[schema.name] = []
 
-    def register(
+    def schema(self, name: str) -> ToolSchema:
+        try:
+            return self._schemas[name]
+        except KeyError as error:
+            raise KeyError(f"unknown tool: {name}") from error
+
+    def execute(
         self,
         name: str,
-        func: Callable,
-        description: str,
-        permissions: List[Permission],
-        parameters: Dict[str, Any],
-        rate_limit: int = 10,
-        requires_approval: bool = False,
+        arguments: Mapping[str, Any],
+        granted_permissions: Sequence[Permission],
+        *,
+        approved: bool = False,
+    ) -> ToolCall:
+        started = time.perf_counter()
+        try:
+            schema = self.schema(name)
+            self._authorize(schema, granted_permissions, approved)
+            self._validate_arguments(schema.parameters, arguments)
+            self._consume_rate_limit(schema)
+            output = self._functions[name](**dict(arguments))
+            call = ToolCall(
+                tool_name=name,
+                input_data=dict(arguments),
+                output_data=output,
+                success=True,
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+        except Exception as error:  # A tool boundary converts failures into inspectable results.
+            call = ToolCall(
+                tool_name=name,
+                input_data=dict(arguments),
+                error=f"{type(error).__name__}: {error}",
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+        self.history.append(call)
+        return call
+
+    @staticmethod
+    def _authorize(
+        schema: ToolSchema, granted_permissions: Sequence[Permission], approved: bool
     ) -> None:
-        """Register a tool."""
-        schema = ToolSchema(
-            name=name,
-            description=description,
-            permissions=permissions,
-            parameters=parameters,
-            rate_limit=rate_limit,
-            requires_approval=requires_approval,
-        )
-        self._tools[name] = schema
-        self._functions[name] = func
-        self._call_counts[name] = []
+        missing = set(schema.permissions) - set(granted_permissions)
+        if missing:
+            names = ", ".join(sorted(item.value for item in missing))
+            raise PermissionError(f"missing permissions: {names}")
+        if schema.requires_approval and not approved:
+            raise PermissionError("explicit approval required")
 
-    def check_permissions(self, tool_name: str, user_permissions: List[Permission]) -> bool:
-        """Check if user has required permissions for a tool."""
-        if tool_name not in self._tools:
-            return False
-        required = set(self._tools[tool_name].permissions)
-        return required.issubset(set(user_permissions))
+    @staticmethod
+    def _validate_arguments(schema: Mapping[str, Any], arguments: Mapping[str, Any]) -> None:
+        if not isinstance(arguments, Mapping):
+            raise TypeError("tool arguments must be an object")
+        required = schema.get("required", [])
+        missing = [name for name in required if name not in arguments]
+        if missing:
+            raise ValueError(f"missing required arguments: {', '.join(missing)}")
+        properties = schema.get("properties", {})
+        extra = set(arguments) - set(properties)
+        if schema.get("additionalProperties") is False and extra:
+            raise ValueError(f"unexpected arguments: {', '.join(sorted(extra))}")
+        type_map = {"string": str, "integer": int, "number": (int, float), "boolean": bool}
+        for name, value in arguments.items():
+            expected_name = properties.get(name, {}).get("type")
+            expected = type_map.get(expected_name)
+            if expected and (isinstance(value, bool) and expected_name in {"integer", "number"}):
+                raise TypeError(f"argument {name!r} must be {expected_name}")
+            if expected and not isinstance(value, expected):
+                raise TypeError(f"argument {name!r} must be {expected_name}")
 
-    def check_rate_limit(self, tool_name: str) -> bool:
-        """Check if tool is within rate limit."""
-        if tool_name not in self._tools:
-            return False
-        now = time.time()
-        window = 60.0  # 1 minute window
-        # Clean old calls
-        self._call_counts[tool_name] = [
-            t for t in self._call_counts[tool_name] if now - t < window
-        ]
-        return len(self._call_counts[tool_name]) < self._tools[tool_name].rate_limit
+    def _consume_rate_limit(self, schema: ToolSchema) -> None:
+        now = self._clock()
+        recent = [timestamp for timestamp in self._calls[schema.name] if now - timestamp < 60]
+        if len(recent) >= schema.rate_limit:
+            raise RuntimeError("rate limit exceeded")
+        recent.append(now)
+        self._calls[schema.name] = recent
 
-    def execute(self, tool_name: str, **kwargs) -> ToolCall:
-        """Execute a tool with validation."""
-        start = time.time()
-
-        if tool_name not in self._tools:
-            return ToolCall(
-                tool_name=tool_name, input_data=kwargs,
-      
+    def audit_log(self) -> list[dict[str, Any]]:
+        return [call.to_dict() for call in self.history]
